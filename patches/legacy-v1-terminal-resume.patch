@@ -161,7 +161,7 @@ index 8645522..8311b48 100644
                      }
                  };
 diff --git a/codex-rs/core/src/agent/control_tests.rs b/codex-rs/core/src/agent/control_tests.rs
-index 6f4cf55..9c322f0 100644
+index 6f4cf55..e87d6a2 100644
 --- a/codex-rs/core/src/agent/control_tests.rs
 +++ b/codex-rs/core/src/agent/control_tests.rs
 @@ -13,6 +13,7 @@ use crate::context::SubagentNotification;
@@ -172,7 +172,7 @@ index 6f4cf55..9c322f0 100644
  use codex_extension_api::ExtensionDataInit;
  use codex_extension_api::empty_extension_registry;
  use codex_features::Feature;
-@@ -3819,6 +3820,125 @@ async fn resume_agent_from_rollout_does_not_reopen_closed_descendants() {
+@@ -3819,6 +3820,128 @@ async fn resume_agent_from_rollout_does_not_reopen_closed_descendants() {
          .expect("tree shutdown after resume should succeed");
  }
  
@@ -246,11 +246,6 @@ index 6f4cf55..9c322f0 100644
 +    .await
 +    .expect("normal completion should close its child edge");
 +
-+    // Simulate the historical defect: completion is durable, but the spawn edge remains open.
-+    graph
-+        .set_thread_spawn_edge_status(child_thread_id, ThreadSpawnEdgeStatus::Open)
-+        .await
-+        .expect("stale edge should be writable");
 +    let _ = harness
 +        .control
 +        .shutdown_live_agent(child_thread_id)
@@ -261,6 +256,14 @@ index 6f4cf55..9c322f0 100644
 +        .shutdown_live_agent(parent_thread_id)
 +        .await
 +        .expect("parent should shut down");
++    assert_thread_not_loaded(&harness.manager, child_thread_id).await;
++
++    // Simulate the historical defect after the old runtime is gone: completion is durable, but
++    // the persisted spawn edge incorrectly remains open across the next application launch.
++    graph
++        .set_thread_spawn_edge_status(child_thread_id, ThreadSpawnEdgeStatus::Open)
++        .await
++        .expect("stale edge should be writable");
 +
 +    harness
 +        .control
