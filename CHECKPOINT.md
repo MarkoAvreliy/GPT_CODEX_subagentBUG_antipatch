@@ -27,7 +27,7 @@ Focused source tests now pass for both behaviors. A real Desktop A/B against his
 - Build the pinned Windows executable and run the real Desktop A/B.
 - Verify that UI `Working`/`Done` state does not reactivate runtime.
 - Measure process trees and model-request logs separately; a badge or local process alone is not proof of token use.
-- Isolate plugins and skills for lightweight child workers, not only heavy MCP servers.
+- Verify deny-by-default child profiles and narrow document, memory, knowledge, browser, and computer-use specialist profiles without reducing the primary orchestrator's capabilities.
 - Rebuild and run UI end-to-end tests against historical task data.
 
 ## Scope of this repository

@@ -11,6 +11,12 @@ The patch targets the process-heavy V2 runtime lifecycle, which matches the affe
 
 The focused tests prove that a completed child runtime disappears while `Completed` remains observable, historical resume succeeds even when a configured required MCP executable is deliberately invalid, and the first real turn starts the deferred MCP server normally.
 
+## Explicit non-goals
+
+This patch does not remove, stub, or globally disable MCP, plugins, browser control, computer use, or Node-based tools such as `node_repl`. Those capabilities must continue to work for the orchestrator and for deliberately selected specialist children. The lifecycle boundary only prevents read-only history hydration from materializing tool runtimes and tears down a completed child's heavy runtime through the existing shutdown path.
+
+Future lightweight children should be implemented by deny-by-default child profiles plus narrow specialist profiles, not by amputating capabilities from Codex Desktop. A general worker can remain tool-light, while document, memory, knowledge, browser, and computer-use workers receive only their required integration. This routing policy is separate from the source patch.
+
 This does not claim to repair every stale `Working` badge. UI reconciliation is separate from runtime ownership and is not allowed to materialize MCP or helper processes merely to display history.
 
 The GitHub Actions workflow builds only a testable `codex.exe` from pinned upstream source. It does not rebuild or redistribute the ChatGPT/Codex Desktop shell.
