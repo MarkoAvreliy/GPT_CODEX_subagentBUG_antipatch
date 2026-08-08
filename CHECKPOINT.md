@@ -1,4 +1,4 @@
-# Checkpoint — 2026-08-07
+# Checkpoint — 2026-08-08
 
 ## Observed problem
 
@@ -20,15 +20,14 @@ MCP process multiplication is a consequence of runtime rehydration when heavy lo
 - **Lazy resume of MCP:** do not start MCP servers solely because a historical task is being restored; initialize them after a real new action needs them.
 - **V2 completed-child cleanup:** after a child reaches a terminal result, call the normal session shutdown path after a short grace period while keeping identity, history, and terminal status available.
 
-Focused source tests now pass for both behaviors. A real Desktop A/B against historical tasks is still required before calling the patch operationally verified.
+Focused source tests pass for both behaviors. The patched Desktop runtime has now also passed repeated automated historical-task opens, a manual four-task UI load, and a real two-child profile smoke test without creating new Python, Node, `node_repl`, or duplicated shared MCP processes. See [the sanitized verification record](docs/VERIFICATION-2026-08-08.md).
 
 ## What remains
 
-- Build the pinned Windows executable and run the real Desktop A/B.
-- Verify that UI `Working`/`Done` state does not reactivate runtime.
-- Measure process trees and model-request logs separately; a badge or local process alone is not proof of token use.
-- Verify deny-by-default child profiles and narrow document, memory, knowledge, browser, and computer-use specialist profiles without reducing the primary orchestrator's capabilities.
-- Rebuild and run UI end-to-end tests against historical task data.
+- Treat stale `Working`/`Done` rendering as a separate UI/state-reconciliation issue; it did not reactivate runtime in the verified patched build.
+- Soak the reduced approximately 14.7k-token clean child baseline; mandatory safety, project, environment, and tool-schema context remains intentionally intact.
+- Soak the bounded three-child workflow in normal work and repeat the smoke test after any Codex update.
+- Upstream the minimal lifecycle findings and tests; retire this workaround when an official build passes the same acceptance criteria.
 
 ## Scope of this repository
 

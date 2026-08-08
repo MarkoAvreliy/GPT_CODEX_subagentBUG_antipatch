@@ -16,7 +16,9 @@ An experimental watcher identifies a child whose terminal response is available,
 
 ## Why this is not the full repair
 
-The legacy controller may persist child spawn records as open. The resume code can walk those open records and recreate descendants even when a child previously returned a final answer. Lazy MCP startup reduces process impact, but it does not correct that persisted lifecycle state or guarantee correct UI status.
+Historical V2 child metadata can still be painted as `Working` before UI reconciliation. The patch prevents that read-only display path from materializing heavy runtime and unloads newly completed child runtimes, but it does not repair every persisted badge or replace the official state-reconciliation implementation.
+
+Lightweight spawning is also a separate routing rule in this Codex version: V2 callers must provide both a child `agent_type` and `fork_turns="none"`. Omitting `fork_turns` selects full-history inheritance and defeats the specialized child profile.
 
 ## Required acceptance tests
 
@@ -25,6 +27,8 @@ The legacy controller may persist child spawn records as open. The resume code c
 3. Run lightweight child workers: after completion and the cleanup grace period, no residual runtime processes remain.
 4. Run an MCP-specialist child: its server starts only for its requested operation and exits when the child lifecycle ends.
 5. Confirm that a newly created task with no child activity has no behavioral regression.
+
+Items 1-4 passed locally on 2026-08-08 for the pinned build; item 5 showed no process-lifecycle regression during the same smoke run. See [the sanitized verification record](VERIFICATION-2026-08-08.md). Repeat all checks after an upstream update.
 
 ## Compatibility and safety
 
