@@ -1,0 +1,57 @@
+name: Build minimal Codex lifecycle root-fix
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - patches/legacy-v1-terminal-resume.patch
+      - .github/workflows/build-rootfix.yml
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out patch checkpoint
+        uses: actions/checkout@v4
+
+      - name: Check out pinned OpenAI Codex source
+        uses: actions/checkout@v4
+        with:
+          repository: openai/codex
+          ref: 618b8e9111da9f57fe380b09d0f6516e3f343536
+          path: upstream-codex
+
+      - name: Apply minimal lifecycle patch
+        shell: pwsh
+        run: git -C upstream-codex apply --check ../patches/legacy-v1-terminal-resume.patch; git -C upstream-codex apply ../patches/legacy-v1-terminal-resume.patch
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: upstream-codex/codex-rs
+
+      - name: Run focused lifecycle regression test
+        working-directory: upstream-codex/codex-rs
+        run: cargo test -p codex-core completed_legacy_child_is_repaired_without_resuming_runtime
+
+      - name: Build patched Codex executable
+        working-directory: upstream-codex/codex-rs
+        run: cargo build --release -p codex-cli --bin codex
+
+      - name: Upload testable executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-lifecycle-rootfix-windows-x64
+          path: upstream-codex/codex-rs/target/release/codex.exe
+          if-no-files-found: error
+          retention-days: 7

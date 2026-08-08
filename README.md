@@ -13,7 +13,7 @@ This repository is **not an official OpenAI fix** and is not a distributable Cod
 - The main legacy defect is still unresolved: persisted child spawn records may remain open, and reopening a parent task can recursively rehydrate those children.
 - Plugin and skill isolation for lightweight child workers remains a separate follow-up item.
 
-See [the compact checkpoint](CHECKPOINT.md) and [patch notes](docs/PATCH-NOTES.md).
+See [the minimal root-fix](docs/ROOT-FIX.md), [the compact checkpoint](CHECKPOINT.md), and [patch notes](docs/PATCH-NOTES.md).
 
 ## Safety
 

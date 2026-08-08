@@ -1,0 +1,291 @@
+diff --git a/codex-rs/core/src/agent/control.rs b/codex-rs/core/src/agent/control.rs
+index 76a7d19..b44d1c2 100644
+--- a/codex-rs/core/src/agent/control.rs
++++ b/codex-rs/core/src/agent/control.rs
+@@ -499,6 +499,22 @@ impl AgentControl {
+                 }
+                 None => true,
+             };
++            // A legacy V1 child has one bounded assignment. Once it reaches a terminal state,
++            // its persisted edge must stop being resumable; otherwise reopening the parent later
++            // reconstructs the child runtime solely because its stale edge still says `Open`.
++            if !child_uses_multi_agent_v2
++                && let Some(agent_graph_store) = state.agent_graph_store()
++                && let Err(err) = agent_graph_store
++                    .set_thread_spawn_edge_status(
++                        child_thread_id,
++                        codex_agent_graph_store::ThreadSpawnEdgeStatus::Closed,
++                    )
++                    .await
++            {
++                warn!(
++                    "failed to persist terminal legacy child edge as closed for {child_thread_id}: {err}"
++                );
++            }
+             if child_agent_path.is_some() && child_uses_multi_agent_v2 {
+                 let Some(child_agent_path) = child_agent_path.clone() else {
+                     return;
+diff --git a/codex-rs/core/src/agent/control/spawn.rs b/codex-rs/core/src/agent/control/spawn.rs
+index 8645522..71922da 100644
+--- a/codex-rs/core/src/agent/control/spawn.rs
++++ b/codex-rs/core/src/agent/control/spawn.rs
+@@ -1,6 +1,8 @@
+ use super::residency::is_v2_resident_session_source;
+ use super::*;
++use crate::agent::agent_status_from_event;
+ use crate::agent::role::apply_role_to_config_for_multi_agent_v2;
++use crate::agent::status::is_final;
+ use crate::config::PermissionProfileSnapshot;
+ use codex_extension_api::ExtensionDataInit;
+ 
+@@ -123,6 +125,37 @@ async fn load_agent_model_context(
+     }
+ }
+ 
++/// Return the last persisted lifecycle status for a child without constructing its runtime.
++///
++/// Legacy V1 could leave a spawn edge `Open` after the child emitted a terminal event. The edge
++/// is topology rather than a reliable lifecycle source, so repair it from the durable rollout
++/// before the legacy resume walk can start MCP, plugins, or any other child runtime.
++async fn persisted_terminal_agent_status(
++    state: &ThreadManagerState,
++    thread_id: ThreadId,
++) -> CodexResult<Option<AgentStatus>> {
++    let stored_thread = state
++        .read_stored_thread(ReadThreadParams {
++            thread_id,
++            include_archived: true,
++            include_history: false,
++        })
++        .await?;
++    let Some(history) =
++        load_agent_model_context(state, thread_id, stored_thread.history_mode).await?
++    else {
++        return Ok(None);
++    };
++    Ok(history
++        .iter()
++        .rev()
++        .find_map(|item| match item {
++            RolloutItem::EventMsg(event) => agent_status_from_event(event),
++            _ => None,
++        })
++        .filter(is_final))
++}
++
+ impl AgentControl {
+     /// Restore persisted V2 agent identities without reopening their runtimes.
+     pub(crate) async fn restore_v2_agent_metadata(
+@@ -872,25 +905,58 @@ impl AgentControl {
+                 let child_resumed = if state.get_thread(child_thread_id).await.is_ok() {
+                     true
+                 } else {
+-                    let child_session_source =
+-                        SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+-                            parent_thread_id,
+-                            depth: child_depth,
+-                            agent_path: None,
+-                            agent_nickname: None,
+-                            agent_role: None,
+-                        });
+-                    match Box::pin(self.resume_single_agent_from_rollout(
+-                        config.clone(),
++                    let terminal_status = match persisted_terminal_agent_status(
++                        &state,
+                         child_thread_id,
+-                        child_session_source,
+-                    ))
++                    )
+                     .await
+                     {
+-                        Ok((_, _)) => true,
++                        Ok(status) => status,
+                         Err(err) => {
+-                            warn!("failed to resume descendant thread {child_thread_id}: {err}");
+-                            false
++                            // A read failure preserves the previous resume behavior rather than
++                            // accidentally treating a possibly-live child as complete.
++                            warn!(
++                                "failed to inspect persisted child lifecycle for {child_thread_id}: {err}"
++                            );
++                            None
++                        }
++                    };
++                    if terminal_status.is_some() {
++                        if let Err(err) = agent_graph_store
++                            .set_thread_spawn_edge_status(
++                                child_thread_id,
++                                codex_agent_graph_store::ThreadSpawnEdgeStatus::Closed,
++                            )
++                            .await
++                        {
++                            warn!(
++                                "failed to close stale terminal child edge {child_thread_id}: {err}"
++                            );
++                        }
++                        false
++                    } else {
++                        let child_session_source =
++                            SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
++                                parent_thread_id,
++                                depth: child_depth,
++                                agent_path: None,
++                                agent_nickname: None,
++                                agent_role: None,
++                            });
++                        match Box::pin(self.resume_single_agent_from_rollout(
++                            config.clone(),
++                            child_thread_id,
++                            child_session_source,
++                        ))
++                        .await
++                        {
++                            Ok((_, _)) => true,
++                            Err(err) => {
++                                warn!(
++                                    "failed to resume descendant thread {child_thread_id}: {err}"
++                                );
++                                false
++                            }
+                         }
+                     }
+                 };
+diff --git a/codex-rs/core/src/agent/control_tests.rs b/codex-rs/core/src/agent/control_tests.rs
+index 6f4cf55..eab725d 100644
+--- a/codex-rs/core/src/agent/control_tests.rs
++++ b/codex-rs/core/src/agent/control_tests.rs
+@@ -13,6 +13,8 @@ use crate::context::SubagentNotification;
+ use crate::init_state_db;
+ use crate::thread_manager::StartThreadOptions;
+ use assert_matches::assert_matches;
++use codex_agent_graph_store::AgentGraphStore;
++use codex_agent_graph_store::ThreadSpawnEdgeStatus;
+ use codex_extension_api::ExtensionDataInit;
+ use codex_extension_api::empty_extension_registry;
+ use codex_features::Feature;
+@@ -3819,6 +3821,125 @@ async fn resume_agent_from_rollout_does_not_reopen_closed_descendants() {
+         .expect("tree shutdown after resume should succeed");
+ }
+ 
++#[tokio::test]
++async fn completed_legacy_child_is_repaired_without_resuming_runtime() {
++    let harness = AgentControlHarness::new().await;
++    let (parent_thread_id, parent_thread) = harness.start_thread().await;
++    let child_thread_id = harness
++        .control
++        .spawn_agent(
++            harness.config.clone(),
++            text_input("hello child"),
++            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
++                parent_thread_id,
++                depth: 1,
++                agent_path: None,
++                agent_nickname: None,
++                agent_role: Some("worker".to_string()),
++            })),
++        )
++        .await
++        .expect("child spawn should succeed");
++    let child_thread = harness
++        .manager
++        .get_thread(child_thread_id)
++        .await
++        .expect("child thread should exist");
++    persist_thread_for_tree_resume(&parent_thread, "parent persisted").await;
++    wait_for_live_thread_spawn_children(&harness.control, parent_thread_id, &[child_thread_id])
++        .await;
++    let child_turn = child_thread.session.new_default_turn().await;
++    child_thread
++        .session
++        .send_event(
++            child_turn.as_ref(),
++            EventMsg::TurnComplete(TurnCompleteEvent {
++                turn_id: child_turn.sub_id.clone(),
++                started_at: None,
++                last_agent_message: Some("done".to_string()),
++                error: None,
++                completed_at: None,
++                duration_ms: None,
++                time_to_first_token_ms: None,
++            }),
++        )
++        .await;
++    child_thread.session.ensure_rollout_materialized().await;
++    child_thread
++        .session
++        .flush_rollout()
++        .await
++        .expect("completed child rollout should flush");
++
++    let state = harness
++        .control
++        .upgrade()
++        .expect("thread manager should be live");
++    let graph = state.agent_graph_store().expect("agent graph should exist");
++    timeout(Duration::from_secs(5), async {
++        loop {
++            let closed = graph
++                .list_thread_spawn_children(parent_thread_id, Some(ThreadSpawnEdgeStatus::Closed))
++                .await
++                .expect("closed child list should load");
++            if closed == vec![child_thread_id] {
++                break;
++            }
++            sleep(Duration::from_millis(25)).await;
++        }
++    })
++    .await
++    .expect("normal completion should close its child edge");
++
++    // Simulate the historical defect: completion is durable, but the spawn edge remains open.
++    graph
++        .set_thread_spawn_edge_status(child_thread_id, ThreadSpawnEdgeStatus::Open)
++        .await
++        .expect("stale edge should be writable");
++    let _ = harness
++        .control
++        .shutdown_live_agent(child_thread_id)
++        .await
++        .expect("completed child should shut down");
++    let _ = harness
++        .control
++        .shutdown_live_agent(parent_thread_id)
++        .await
++        .expect("parent should shut down");
++
++    harness
++        .control
++        .resume_agent_from_rollout(
++            harness.config.clone(),
++            parent_thread_id,
++            SessionSource::Exec,
++        )
++        .await
++        .expect("parent resume should succeed");
++
++    assert_thread_not_loaded(&harness.manager, child_thread_id).await;
++    assert_eq!(
++        graph
++            .list_thread_spawn_children(parent_thread_id, Some(ThreadSpawnEdgeStatus::Open))
++            .await
++            .expect("open child list should load"),
++        Vec::<ThreadId>::new()
++    );
++    assert_eq!(
++        graph
++            .list_thread_spawn_children(parent_thread_id, Some(ThreadSpawnEdgeStatus::Closed))
++            .await
++            .expect("closed child list should load"),
++        vec![child_thread_id]
++    );
++
++    let _ = harness
++        .control
++        .shutdown_live_agent(parent_thread_id)
++        .await
++        .expect("resumed parent should shut down");
++}
++
+ #[tokio::test]
+ async fn resume_closed_child_reopens_open_descendants() {
+     let harness = AgentControlHarness::new().await;
