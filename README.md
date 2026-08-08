@@ -8,9 +8,10 @@ This repository is **not an official OpenAI fix** and is not a distributable Cod
 
 ## Current status
 
-- A local experimental build can defer MCP startup while an old task is merely being restored.
-- A local experiment can unload a completed child runtime while retaining its terminal status for the UI.
-- The main legacy defect is still unresolved: persisted child spawn records may remain open, and reopening a parent task can recursively rehydrate those children.
+- The affected local histories are predominantly `multi_agent_version: v2`, even when their storage mode is named `legacy`; the earlier V1-only diagnosis was insufficient.
+- The current patch defers MCP startup while an old task is merely displayed and restores it on the first real foreground action.
+- The current patch unloads a completed V2 child runtime through the normal shutdown path while retaining its logical identity and terminal status.
+- Stale `Working` rendering remains a separate UI/state-reconciliation defect; it must not force runtime startup.
 - Plugin and skill isolation for lightweight child workers remains a separate follow-up item.
 
 See [the minimal root-fix](docs/ROOT-FIX.md), [the compact checkpoint](CHECKPOINT.md), and [patch notes](docs/PATCH-NOTES.md).

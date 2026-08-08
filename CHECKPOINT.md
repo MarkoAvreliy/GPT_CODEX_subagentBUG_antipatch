@@ -8,25 +8,25 @@ The behavior is reproducible enough to treat it as a lifecycle/state-restoration
 
 ## Evidence-backed hypothesis
 
-The legacy multi-agent resume path can recursively restore child agents whose persisted spawn records are still marked open. That creates two related but distinct failures:
+Inspection of the affected rollouts corrected the earlier diagnosis: their storage mode is called `legacy`, but their actual agent lifecycle is V2. In V2, logical child identity remains resident after completion while heavy per-session runtime ownership is coupled to that identity. This creates two related but distinct failures:
 
 1. stale UI lifecycle state (`Working` instead of terminal state);
-2. runtime rehydration when a historical parent task is opened.
+2. unnecessary runtime/MCP rehydration when history is opened, plus completed V2 runtimes remaining resident.
 
 MCP process multiplication is a consequence of runtime rehydration when heavy local tools are available; it is not, by itself, the root cause.
 
 ## Experimental anti-patch currently tested
 
 - **Lazy resume of MCP:** do not start MCP servers solely because a historical task is being restored; initialize them after a real new action needs them.
-- **Completed-child cleanup:** after a child reaches a terminal result, unload its active runtime after a short grace period while keeping the terminal status available to the UI.
+- **V2 completed-child cleanup:** after a child reaches a terminal result, call the normal session shutdown path after a short grace period while keeping identity, history, and terminal status available.
 
-In controlled smoke tests, this prevented residual Python/Node helper processes after lightweight child completion. It does **not** yet close or migrate old persisted spawn records, so it is not a permanent repair.
+Focused source tests now pass for both behaviors. A real Desktop A/B against historical tasks is still required before calling the patch operationally verified.
 
 ## What remains
 
-- Persist or infer terminal closure for completed legacy children.
-- Prevent recursive rehydration of terminal descendants during parent-task resume.
-- Verify that UI `Working`/`Done` state is reconciled from durable lifecycle data.
+- Build the pinned Windows executable and run the real Desktop A/B.
+- Verify that UI `Working`/`Done` state does not reactivate runtime.
+- Measure process trees and model-request logs separately; a badge or local process alone is not proof of token use.
 - Isolate plugins and skills for lightweight child workers, not only heavy MCP servers.
 - Rebuild and run UI end-to-end tests against historical task data.
 

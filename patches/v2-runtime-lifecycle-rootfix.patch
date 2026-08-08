@@ -1,0 +1,632 @@
+﻿diff --git a/codex-rs/app-server/tests/suite/v2/thread_resume.rs b/codex-rs/app-server/tests/suite/v2/thread_resume.rs
+index a4410da23..fe816687e 100644
+--- a/codex-rs/app-server/tests/suite/v2/thread_resume.rs
++++ b/codex-rs/app-server/tests/suite/v2/thread_resume.rs
+@@ -4086,6 +4086,40 @@ required = true"#,
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn lazy_thread_resume_defers_required_mcp_initialization() -> Result<()> {
++    let server = create_mock_responses_server_repeating_assistant("Done").await;
++    let codex_home = TempDir::new()?;
++    let rollout = setup_rollout_fixture(codex_home.path(), &server.uri()).await?;
++    mock_responses_config(&server.uri())
++        .with_extra_config(
++            r#"[mcp_servers.required_broken]
++command = "codex-definitely-not-a-real-binary"
++required = true"#,
++        )
++        .write(codex_home.path())?;
++
++    let mut mcp = TestAppServer::builder()
++        .with_codex_home(codex_home.path())
++        .with_env_overrides(&[("CODEX_EXPERIMENTAL_LAZY_RESUME_MCP", Some("1"))])
++        .build_initialized()
++        .await?;
++
++    let resume_id = mcp
++        .send_thread_resume_request(ThreadResumeParams {
++            thread_id: rollout.conversation_id.clone(),
++            ..Default::default()
++        })
++        .await?;
++    let ThreadResumeResponse { thread, .. } =
++        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
++
++    assert_eq!(thread.id, rollout.conversation_id);
++    assert_eq!(thread.status, ThreadStatus::Idle);
++
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn thread_resume_surfaces_cloud_config_bundle_load_errors() -> Result<()> {
+     let server = MockServer::start().await;
+diff --git a/codex-rs/core/src/agent/control.rs b/codex-rs/core/src/agent/control.rs
+index 76a7d19b8..da78b4eaf 100644
+--- a/codex-rs/core/src/agent/control.rs
++++ b/codex-rs/core/src/agent/control.rs
+@@ -276,13 +276,18 @@ impl AgentControl {
+     /// Fetch the last known status for `agent_id`, returning `NotFound` when unavailable.
+     pub(crate) async fn get_status(&self, agent_id: ThreadId) -> AgentStatus {
+         let Ok(state) = self.upgrade() else {
+-            // No agent available if upgrade fails.
+-            return AgentStatus::NotFound;
++            return self
++                .state
++                .terminal_status(agent_id)
++                .unwrap_or(AgentStatus::NotFound);
+         };
+-        let Ok(thread) = state.get_thread(agent_id).await else {
+-            return AgentStatus::NotFound;
+-        };
+-        thread.agent_status().await
++        match state.get_thread(agent_id).await {
++            Ok(thread) => thread.agent_status().await,
++            Err(_) => self
++                .state
++                .terminal_status(agent_id)
++                .unwrap_or(AgentStatus::NotFound),
++        }
+     }
+ 
+     pub(crate) fn register_session_root(
+@@ -354,8 +359,13 @@ impl AgentControl {
+         agent_id: ThreadId,
+     ) -> CodexResult<watch::Receiver<AgentStatus>> {
+         let state = self.upgrade()?;
+-        let thread = state.get_thread(agent_id).await?;
+-        Ok(thread.subscribe_status())
++        match state.get_thread(agent_id).await {
++            Ok(thread) => Ok(thread.subscribe_status()),
++            Err(err) => match self.state.terminal_status(agent_id) {
++                Some(status) => Ok(watch::channel(status).1),
++                None => Err(err),
++            },
++        }
+     }
+ 
+     pub(crate) async fn format_environment_context_subagents(
+@@ -435,8 +445,12 @@ impl AgentControl {
+                 continue;
+             }
+ 
+-            let Ok(thread) = state.get_thread(thread_id).await else {
+-                continue;
++            let agent_status = match state.get_thread(thread_id).await {
++                Ok(thread) => thread.agent_status().await,
++                Err(_) => match self.state.terminal_status(thread_id) {
++                    Some(status) => status,
++                    None => continue,
++                },
+             };
+             let agent_name = metadata
+                 .agent_path
+@@ -445,7 +459,7 @@ impl AgentControl {
+                 .unwrap_or_else(|| thread_id.to_string());
+             agents.push(ListedAgent {
+                 agent_name,
+-                agent_status: thread.agent_status().await,
++                agent_status,
+             });
+         }
+ 
+@@ -546,6 +560,39 @@ impl AgentControl {
+         });
+     }
+ 
++    /// V2 keeps logical child identity after completion, but its process-heavy runtime does not
++    /// need to remain resident. Observe completion outside the child session and unload only the
++    /// runtime; registry metadata and terminal status stay available for UI/history and explicit
++    /// resume.
++    fn maybe_start_v2_runtime_unload_watcher(&self, child_thread_id: ThreadId) {
++        let control = self.clone();
++        tokio::spawn(async move {
++            let status = match control.subscribe_status(child_thread_id).await {
++                Ok(mut status_rx) => {
++                    let mut status = status_rx.borrow().clone();
++                    while !is_final(&status) {
++                        if status_rx.changed().await.is_err() {
++                            status = control.get_status(child_thread_id).await;
++                            break;
++                        }
++                        status = status_rx.borrow().clone();
++                    }
++                    status
++                }
++                Err(_) => control.get_status(child_thread_id).await,
++            };
++            if !is_final(&status) {
++                return;
++            }
++            let Ok(state) = control.upgrade() else {
++                return;
++            };
++            control
++                .maybe_unload_completed_agent_runtime(&state, child_thread_id, status)
++                .await;
++        });
++    }
++
+     fn prepare_agent_metadata(
+         &self,
+         reservation: &mut crate::agent::registry::SpawnReservation,
+diff --git a/codex-rs/core/src/agent/control/residency.rs b/codex-rs/core/src/agent/control/residency.rs
+index 99fa05112..ed188dcd8 100644
+--- a/codex-rs/core/src/agent/control/residency.rs
++++ b/codex-rs/core/src/agent/control/residency.rs
+@@ -12,8 +12,18 @@ use codex_protocol::protocol::SessionSource;
+ use std::collections::VecDeque;
+ use std::sync::Arc;
+ use std::sync::Mutex;
++use std::sync::OnceLock;
++use std::time::Duration;
++use tokio::time::sleep;
+ use tracing::warn;
+ 
++const AUTO_UNLOAD_COMPLETED_AGENTS_ENV: &str = "CODEX_EXPERIMENTAL_AUTO_UNLOAD_COMPLETED_AGENTS";
++const AUTO_UNLOAD_COMPLETED_AGENTS_DELAY_SECS_ENV: &str =
++    "CODEX_EXPERIMENTAL_AUTO_UNLOAD_COMPLETED_AGENTS_DELAY_SECS";
++const DEFAULT_AUTO_UNLOAD_DELAY_SECS: u64 = 5;
++const UNLOAD_READINESS_RETRY_COUNT: usize = 50;
++const UNLOAD_READINESS_RETRY_DELAY: Duration = Duration::from_millis(100);
++
+ #[derive(Default)]
+ pub(super) struct V2Residency {
+     state: Mutex<V2ResidencyState>,
+@@ -75,6 +85,88 @@ impl AgentControl {
+     pub(super) fn forget_v2_residency(&self, thread_id: ThreadId) {
+         self.v2_residency.remove(thread_id);
+     }
++
++    pub(super) async fn maybe_unload_completed_agent_runtime(
++        &self,
++        state: &Arc<ThreadManagerState>,
++        thread_id: ThreadId,
++        terminal_status: AgentStatus,
++    ) {
++        if !auto_unload_completed_agents_enabled() {
++            return;
++        }
++        self.unload_completed_agent_runtime_after(
++            state,
++            thread_id,
++            terminal_status,
++            auto_unload_completed_agents_delay(),
++        )
++        .await;
++    }
++
++    async fn unload_completed_agent_runtime_after(
++        &self,
++        state: &Arc<ThreadManagerState>,
++        thread_id: ThreadId,
++        terminal_status: AgentStatus,
++        delay: Duration,
++    ) {
++        sleep(delay).await;
++        let mut candidate_thread = None;
++        for _ in 0..UNLOAD_READINESS_RETRY_COUNT {
++            let Ok(thread) = state.get_thread(thread_id).await else {
++                return;
++            };
++            if is_unloadable(thread.as_ref()).await {
++                candidate_thread = Some(thread);
++                break;
++            }
++            sleep(UNLOAD_READINESS_RETRY_DELAY).await;
++        }
++        let Some(candidate_thread) = candidate_thread else {
++            warn!("completed agent {thread_id} did not become idle for runtime unload");
++            return;
++        };
++
++        candidate_thread.ensure_rollout_materialized().await;
++        self.state
++            .remember_terminal_status(thread_id, terminal_status);
++        if let Err(err) = candidate_thread.shutdown_and_wait().await {
++            self.state.forget_terminal_status(thread_id);
++            warn!("failed to shut down completed agent runtime {thread_id}: {err}");
++            return;
++        }
++        let _ = state.remove_thread(&thread_id).await;
++        self.forget_v2_residency(thread_id);
++    }
++}
++
++fn auto_unload_completed_agents_enabled() -> bool {
++    static ENABLED: OnceLock<bool> = OnceLock::new();
++    *ENABLED.get_or_init(|| {
++        std::env::var(AUTO_UNLOAD_COMPLETED_AGENTS_ENV)
++            .ok()
++            .as_deref()
++            .is_some_and(parse_env_bool)
++    })
++}
++
++fn auto_unload_completed_agents_delay() -> Duration {
++    static DELAY: OnceLock<Duration> = OnceLock::new();
++    *DELAY.get_or_init(|| {
++        let seconds = std::env::var(AUTO_UNLOAD_COMPLETED_AGENTS_DELAY_SECS_ENV)
++            .ok()
++            .and_then(|value| value.parse::<u64>().ok())
++            .unwrap_or(DEFAULT_AUTO_UNLOAD_DELAY_SECS);
++        Duration::from_secs(seconds)
++    })
++}
++
++fn parse_env_bool(value: &str) -> bool {
++    matches!(
++        value.trim().to_ascii_lowercase().as_str(),
++        "1" | "true" | "yes" | "on"
++    )
+ }
+ 
+ impl V2Residency {
+diff --git a/codex-rs/core/src/agent/control/residency_tests.rs b/codex-rs/core/src/agent/control/residency_tests.rs
+index 75afdd45c..21a98a07e 100644
+--- a/codex-rs/core/src/agent/control/residency_tests.rs
++++ b/codex-rs/core/src/agent/control/residency_tests.rs
+@@ -9,6 +9,7 @@ use codex_features::Feature;
+ use codex_login::CodexAuth;
+ use codex_protocol::ThreadId;
+ use codex_protocol::error::CodexErrorDetails;
++use codex_protocol::protocol::AgentStatus;
+ use codex_protocol::protocol::EventMsg;
+ use codex_protocol::protocol::SessionSource;
+ use codex_protocol::protocol::SubAgentSource;
+@@ -18,6 +19,56 @@ use codex_protocol::protocol::TurnAbortedEvent;
+ use codex_protocol::protocol::TurnCompleteEvent;
+ use pretty_assertions::assert_eq;
+ use std::sync::Arc;
++use std::time::Duration;
++
++#[tokio::test]
++async fn completed_agent_runtime_unloads_but_terminal_status_remains_observable() {
++    let mut config = test_config().await;
++    let _ = config.features.enable(Feature::MultiAgentV2);
++    let temp_home = tempfile::tempdir().expect("create temp home");
++    config.codex_home = temp_home.path().to_path_buf().try_into().unwrap();
++    config.cwd = temp_home.path().to_path_buf().try_into().unwrap();
++    let manager = ThreadManager::with_models_provider_and_home_for_tests(
++        CodexAuth::from_api_key("dummy"),
++        config.model_provider.clone(),
++        config.codex_home.to_path_buf(),
++        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
++    );
++    let root = manager
++        .start_thread(StartThreadOptions::new(config.clone()))
++        .await
++        .expect("start root thread");
++    let control = manager.agent_control();
++    let state = control.upgrade().expect("thread manager should be live");
++    let child =
++        spawn_v2_subagent(&control, &state, config, root.thread_id, "completed-worker").await;
++    let completed = AgentStatus::Completed(Some("done".to_string()));
++    mark_thread_completed(child.thread.as_ref()).await;
++
++    control
++        .unload_completed_agent_runtime_after(
++            &state,
++            child.thread_id,
++            completed.clone(),
++            Duration::ZERO,
++        )
++        .await;
++
++    match manager.get_thread(child.thread_id).await {
++        Err(err) => match err.details() {
++            CodexErrorDetails::ThreadNotFound(thread_id) => assert_eq!(*thread_id, child.thread_id),
++            _ => panic!("expected unloaded thread to be missing, got {err:?}"),
++        },
++        Ok(_) => panic!("completed runtime should be unloaded"),
++    }
++    assert_eq!(control.get_status(child.thread_id).await, completed);
++    let status_rx = control
++        .subscribe_status(child.thread_id)
++        .await
++        .expect("cached terminal status should remain subscribable");
++    assert_eq!(*status_rx.borrow(), completed);
++    assert!(manager.get_thread(root.thread_id).await.is_ok());
++}
+ 
+ #[tokio::test]
+ async fn residency_slot_reservation_unloads_oldest_idle_v2_agent() {
+diff --git a/codex-rs/core/src/agent/control/spawn.rs b/codex-rs/core/src/agent/control/spawn.rs
+index 864552249..0839197b1 100644
+--- a/codex-rs/core/src/agent/control/spawn.rs
++++ b/codex-rs/core/src/agent/control/spawn.rs
+@@ -255,6 +255,7 @@ impl AgentControl {
+         let state = self.upgrade()?;
+         if state.get_thread(thread_id).await.is_ok() {
+             self.touch_loaded_v2_residency(&state, thread_id).await;
++            self.maybe_start_v2_runtime_unload_watcher(thread_id);
+             return Ok(());
+         }
+         if self.state.agent_metadata_for_thread(thread_id).is_none() {
+@@ -349,6 +350,7 @@ impl AgentControl {
+             Ok(reloaded_thread) => {
+                 residency_slot.commit(reloaded_thread.thread_id);
+                 state.notify_thread_created(reloaded_thread.thread_id);
++                self.maybe_start_v2_runtime_unload_watcher(reloaded_thread.thread_id);
+                 Ok(())
+             }
+             Err(err) => {
+@@ -558,6 +560,8 @@ impl AgentControl {
+                 child_reference,
+                 agent_metadata.agent_path.clone(),
+             );
++        } else if spawn_uses_v2_residency {
++            self.maybe_start_v2_runtime_unload_watcher(new_thread.thread_id);
+         }
+ 
+         Ok(LiveAgent {
+diff --git a/codex-rs/core/src/agent/registry.rs b/codex-rs/core/src/agent/registry.rs
+index e1ceccae1..bd279c68f 100644
+--- a/codex-rs/core/src/agent/registry.rs
++++ b/codex-rs/core/src/agent/registry.rs
+@@ -3,6 +3,7 @@ use codex_protocol::ThreadId;
+ use codex_protocol::error::CodexErr;
+ use codex_protocol::error::CodexErrorDetails;
+ use codex_protocol::error::Result;
++use codex_protocol::protocol::AgentStatus;
+ use codex_protocol::protocol::SessionSource;
+ use codex_protocol::protocol::SubAgentSource;
+ use rand::prelude::IndexedRandom;
+@@ -30,6 +31,7 @@ pub(crate) struct AgentRegistry {
+ struct ActiveAgents {
+     agent_tree: HashMap<String, AgentMetadata>,
+     thread_paths: HashMap<ThreadId, String>,
++    terminal_statuses: HashMap<ThreadId, AgentStatus>,
+     used_agent_nicknames: HashSet<String>,
+     nickname_reset_count: usize,
+ }
+@@ -105,6 +107,7 @@ impl AgentRegistry {
+                 .active_agents
+                 .lock()
+                 .unwrap_or_else(std::sync::PoisonError::into_inner);
++            active_agents.terminal_statuses.remove(&thread_id);
+             active_agents
+                 .thread_paths
+                 .remove(&thread_id)
+@@ -159,6 +162,31 @@ impl AgentRegistry {
+             .cloned()
+     }
+ 
++    pub(crate) fn remember_terminal_status(&self, thread_id: ThreadId, status: AgentStatus) {
++        self.active_agents
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++            .terminal_statuses
++            .insert(thread_id, status);
++    }
++
++    pub(crate) fn terminal_status(&self, thread_id: ThreadId) -> Option<AgentStatus> {
++        self.active_agents
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++            .terminal_statuses
++            .get(&thread_id)
++            .cloned()
++    }
++
++    pub(crate) fn forget_terminal_status(&self, thread_id: ThreadId) {
++        self.active_agents
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++            .terminal_statuses
++            .remove(&thread_id);
++    }
++
+     pub(crate) fn live_agents(&self) -> Vec<AgentMetadata> {
+         self.active_agents
+             .lock()
+@@ -181,6 +209,7 @@ impl AgentRegistry {
+             .active_agents
+             .lock()
+             .unwrap_or_else(std::sync::PoisonError::into_inner);
++        active_agents.terminal_statuses.remove(&thread_id);
+         let key = agent_metadata
+             .agent_path
+             .as_ref()
+diff --git a/codex-rs/core/src/session/mcp.rs b/codex-rs/core/src/session/mcp.rs
+index 042a7014e..d5939a7e4 100644
+--- a/codex-rs/core/src/session/mcp.rs
++++ b/codex-rs/core/src/session/mcp.rs
+@@ -149,6 +149,8 @@ impl Session {
+ 
+     /// Publishes changed MCP state, waiting for any refresh already in progress.
+     pub(crate) async fn refresh_mcp_if_dirty(self: &Arc<Self>) {
++        // A real foreground caller activates a runtime that was deferred during history resume.
++        self.activate_mcp_runtime();
+         let Ok(_refresh) = self.mcp_refresh.acquire().await else {
+             error!("MCP runtime refresh semaphore closed");
+             return;
+diff --git a/codex-rs/core/src/session/mcp_prewarm.rs b/codex-rs/core/src/session/mcp_prewarm.rs
+index f4b45b6e2..67aeb8c56 100644
+--- a/codex-rs/core/src/session/mcp_prewarm.rs
++++ b/codex-rs/core/src/session/mcp_prewarm.rs
+@@ -4,6 +4,7 @@
+ //! newest thread state; exact model steps remain the correctness path.
+ 
+ use super::*;
++use std::sync::atomic::Ordering;
+ 
+ impl Session {
+     pub(crate) fn request_mcp_runtime_refresh(&self) {
+@@ -45,7 +46,7 @@ impl Session {
+                 tokio::select! {
+                     biased;
+                     _ = shutdown.cancelled() => break,
+-                    _ = session.refresh_mcp_if_dirty() => {},
++                    _ = session.refresh_mcp_if_active() => {},
+                 }
+             }
+         });
+@@ -59,6 +60,24 @@ impl Session {
+         let _ = self.mcp_prewarm_tx.try_send(());
+     }
+ 
++    pub(super) fn activate_mcp_runtime(&self) {
++        self.mcp_runtime_activated.store(true, Ordering::Release);
++    }
++
++    pub(super) fn deactivate_mcp_runtime(&self) {
++        self.mcp_runtime_activated.store(false, Ordering::Release);
++    }
++
++    pub(super) fn mcp_runtime_is_activated(&self) -> bool {
++        self.mcp_runtime_activated.load(Ordering::Acquire)
++    }
++
++    pub(super) async fn refresh_mcp_if_active(self: &Arc<Self>) {
++        if self.mcp_runtime_is_activated() {
++            self.refresh_mcp_if_dirty().await;
++        }
++    }
++
+     pub(super) async fn stop_mcp_prewarm_worker(&self) {
+         self.mcp_prewarm_shutdown.cancel();
+         let worker = self
+diff --git a/codex-rs/core/src/session/mcp_runtime.rs b/codex-rs/core/src/session/mcp_runtime.rs
+index 9a68c553b..5da496ae5 100644
+--- a/codex-rs/core/src/session/mcp_runtime.rs
++++ b/codex-rs/core/src/session/mcp_runtime.rs
+@@ -11,6 +11,21 @@ use codex_mcp::ElicitationReviewerHandle;
+ use codex_mcp::PreparedMcpCall;
+ use codex_protocol::capabilities::SelectedCapabilityRoot;
+ 
++const LAZY_RESUME_MCP_ENV: &str = "CODEX_EXPERIMENTAL_LAZY_RESUME_MCP";
++
++pub(super) fn lazy_resume_mcp_enabled() -> bool {
++    std::env::var(LAZY_RESUME_MCP_ENV)
++        .ok()
++        .is_some_and(|value| env_flag_enabled(&value))
++}
++
++fn env_flag_enabled(value: &str) -> bool {
++    matches!(
++        value.trim().to_ascii_lowercase().as_str(),
++        "1" | "true" | "yes" | "on"
++    )
++}
++
+ pub(super) struct McpDesiredState {
+     pub(super) config: Arc<Config>,
+     pub(super) auth: Option<CodexAuth>,
+@@ -20,6 +35,28 @@ pub(super) struct McpDesiredState {
+     pub(super) windows_sandbox_level: WindowsSandboxLevel,
+ }
+ 
++#[cfg(test)]
++mod lazy_resume_tests {
++    use super::env_flag_enabled;
++
++    #[test]
++    fn accepts_explicit_enabled_values() {
++        for value in ["1", "true", "TRUE", "yes", "on", " On "] {
++            assert!(env_flag_enabled(value), "expected {value:?} to enable flag");
++        }
++    }
++
++    #[test]
++    fn rejects_missing_or_ambiguous_values() {
++        for value in ["", "0", "false", "off", "enabled", "2"] {
++            assert!(
++                !env_flag_enabled(value),
++                "expected {value:?} to disable flag"
++            );
++        }
++    }
++}
++
+ impl McpDesiredState {
+     pub(super) fn local_stdio_fallback_cwd(&self) -> PathBuf {
+         self.environments
+diff --git a/codex-rs/core/src/session/session.rs b/codex-rs/core/src/session/session.rs
+index 29bd0af11..1abbae6ba 100644
+--- a/codex-rs/core/src/session/session.rs
++++ b/codex-rs/core/src/session/session.rs
+@@ -25,6 +25,7 @@ use codex_protocol::protocol::ThreadHistoryMode;
+ use codex_protocol::protocol::ThreadSource;
+ use codex_protocol::protocol::TurnEnvironmentSelections;
+ use std::sync::OnceLock;
++use std::sync::atomic::AtomicBool;
+ use tokio::sync::Semaphore;
+ 
+ /// Context for an initialized model agent
+@@ -47,6 +48,8 @@ pub(crate) struct Session {
+     pub(super) multi_agent_version: OnceLock<MultiAgentVersion>,
+     /// Owns invalidation and serializes refreshes without blocking captured calls.
+     pub(super) mcp_refresh: McpRefresh,
++    /// False while a resumed historical session has not crossed a real MCP boundary.
++    pub(super) mcp_runtime_activated: AtomicBool,
+     pub(super) mcp_elicitation_reviewer_handle: OnceLock<codex_mcp::ElicitationReviewerHandle>,
+     pub(super) mcp_elicitation_lifecycle_handle: OnceLock<codex_mcp::ElicitationLifecycle>,
+     pub(super) mcp_prewarm_tx: async_channel::Sender<()>,
+@@ -1187,6 +1190,7 @@ impl Session {
+                 windows_sandbox_proxy_settings_mode,
+                 multi_agent_version,
+                 mcp_refresh: McpRefresh::new(),
++                mcp_runtime_activated: AtomicBool::new(true),
+                 mcp_elicitation_reviewer_handle: OnceLock::new(),
+                 mcp_elicitation_lifecycle_handle: OnceLock::new(),
+                 mcp_prewarm_tx,
+@@ -1269,17 +1273,26 @@ impl Session {
+             } else {
+                 mcp_projection
+             };
+-            sess.install_initial_mcp_runtime(
+-                &session_configuration,
+-                latest_auth,
+-                mcp_projection,
+-                &resolved_environments,
+-                mcp_runtime_cwd,
+-            )
+-            .await?;
++            let lazy_resume_mcp = matches!(&initial_history, InitialHistory::Resumed(_))
++                && super::mcp_runtime::lazy_resume_mcp_enabled();
++            if lazy_resume_mcp {
++                sess.deactivate_mcp_runtime();
++                sess.mark_mcp_runtime_dirty();
++            } else {
++                sess.install_initial_mcp_runtime(
++                    &session_configuration,
++                    latest_auth,
++                    mcp_projection,
++                    &resolved_environments,
++                    mcp_runtime_cwd,
++                )
++                .await?;
++            }
+             sess.start_mcp_prewarm_worker(mcp_prewarm_rx, mcp_auth_changes);
+-            sess.schedule_startup_prewarm(session_configuration.base_instructions.clone())
+-                .await;
++            if !lazy_resume_mcp {
++                sess.schedule_startup_prewarm(session_configuration.base_instructions.clone())
++                    .await;
++            }
+             let session_start_source = match &initial_history {
+                 InitialHistory::Resumed(_) => codex_hooks::SessionStartSource::Resume,
+                 InitialHistory::New | InitialHistory::Forked(_) => {
+diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
+index b8a91c4b3..8638aa09e 100644
+--- a/codex-rs/core/src/session/tests.rs
++++ b/codex-rs/core/src/session/tests.rs
+@@ -5839,6 +5839,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
+             codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
+         multi_agent_version: OnceLock::from(config.multi_agent_version_from_features()),
+         mcp_refresh: McpRefresh::new(),
++        mcp_runtime_activated: std::sync::atomic::AtomicBool::new(true),
+         mcp_elicitation_reviewer_handle: OnceLock::new(),
+         mcp_elicitation_lifecycle_handle: OnceLock::new(),
+         mcp_prewarm_tx: async_channel::bounded(1).0,
+@@ -8042,6 +8043,7 @@ where
+             codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
+         multi_agent_version: OnceLock::from(config.multi_agent_version_from_features()),
+         mcp_refresh: McpRefresh::new(),
++        mcp_runtime_activated: std::sync::atomic::AtomicBool::new(true),
+         mcp_elicitation_reviewer_handle: OnceLock::new(),
+         mcp_elicitation_lifecycle_handle: OnceLock::new(),
+         mcp_prewarm_tx: async_channel::bounded(1).0,

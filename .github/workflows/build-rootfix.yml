@@ -1,11 +1,11 @@
-name: Build minimal Codex lifecycle root-fix
+name: Build Codex V2 runtime lifecycle root-fix
 
 on:
   workflow_dispatch:
   push:
     branches: [main]
     paths:
-      - patches/legacy-v1-terminal-resume.patch
+      - patches/v2-runtime-lifecycle-rootfix.patch
       - .github/workflows/build-rootfix.yml
 
 permissions:
@@ -26,9 +26,9 @@ jobs:
           ref: 618b8e9111da9f57fe380b09d0f6516e3f343536
           path: upstream-codex
 
-      - name: Apply minimal lifecycle patch
+      - name: Apply V2 runtime lifecycle patch
         shell: pwsh
-        run: git -C upstream-codex apply --check ../patches/legacy-v1-terminal-resume.patch; git -C upstream-codex apply ../patches/legacy-v1-terminal-resume.patch
+        run: git -C upstream-codex apply --check ../patches/v2-runtime-lifecycle-rootfix.patch; git -C upstream-codex apply ../patches/v2-runtime-lifecycle-rootfix.patch
 
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -40,11 +40,21 @@ jobs:
         with:
           workspaces: upstream-codex/codex-rs
 
-      - name: Run focused lifecycle regression test
+      - name: Check patched core
+        working-directory: upstream-codex/codex-rs
+        run: cargo check -p codex-core --lib
+
+      - name: Test V2 runtime unload
         working-directory: upstream-codex/codex-rs
         env:
           RUST_MIN_STACK: "8388608"
-        run: cargo test -p codex-core completed_legacy_child_is_repaired_without_resuming_runtime
+        run: cargo test -p codex-core completed_agent_runtime_unloads_but_terminal_status_remains_observable
+
+      - name: Test lazy historical resume
+        working-directory: upstream-codex/codex-rs
+        env:
+          RUST_MIN_STACK: "8388608"
+        run: cargo test -p codex-app-server lazy_thread_resume_defers_required_mcp_initialization
 
       - name: Build patched Codex executable
         working-directory: upstream-codex/codex-rs
