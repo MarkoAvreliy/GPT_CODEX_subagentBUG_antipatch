@@ -26,7 +26,7 @@ index 76a7d19..b44d1c2 100644
                  let Some(child_agent_path) = child_agent_path.clone() else {
                      return;
 diff --git a/codex-rs/core/src/agent/control/spawn.rs b/codex-rs/core/src/agent/control/spawn.rs
-index 8645522..8311b48 100644
+index 8645522..35b90b1 100644
 --- a/codex-rs/core/src/agent/control/spawn.rs
 +++ b/codex-rs/core/src/agent/control/spawn.rs
 @@ -1,6 +1,8 @@
@@ -47,7 +47,7 @@ index 8645522..8311b48 100644
 +/// Legacy V1 could leave a spawn edge `Open` after the child emitted a terminal event. The edge
 +/// is topology rather than a reliable lifecycle source, so repair it from the durable rollout
 +/// before the legacy resume walk can start MCP, plugins, or any other child runtime.
-+async fn persisted_terminal_agent_status(
++pub(super) async fn persisted_terminal_agent_status(
 +    state: &ThreadManagerState,
 +    thread_id: ThreadId,
 +) -> CodexResult<Option<AgentStatus>> {
@@ -161,7 +161,7 @@ index 8645522..8311b48 100644
                      }
                  };
 diff --git a/codex-rs/core/src/agent/control_tests.rs b/codex-rs/core/src/agent/control_tests.rs
-index 6f4cf55..e87d6a2 100644
+index 6f4cf55..f13d81d 100644
 --- a/codex-rs/core/src/agent/control_tests.rs
 +++ b/codex-rs/core/src/agent/control_tests.rs
 @@ -13,6 +13,7 @@ use crate::context::SubagentNotification;
@@ -172,7 +172,7 @@ index 6f4cf55..e87d6a2 100644
  use codex_extension_api::ExtensionDataInit;
  use codex_extension_api::empty_extension_registry;
  use codex_features::Feature;
-@@ -3819,6 +3820,128 @@ async fn resume_agent_from_rollout_does_not_reopen_closed_descendants() {
+@@ -3819,6 +3820,146 @@ async fn resume_agent_from_rollout_does_not_reopen_closed_descendants() {
          .expect("tree shutdown after resume should succeed");
  }
  
@@ -256,7 +256,21 @@ index 6f4cf55..e87d6a2 100644
 +        .shutdown_live_agent(parent_thread_id)
 +        .await
 +        .expect("parent should shut down");
-+    assert_thread_not_loaded(&harness.manager, child_thread_id).await;
++    assert_eq!(
++        harness.control.get_status(child_thread_id).await,
++        AgentStatus::NotFound,
++        "child runtime remained loaded before parent resume"
++    );
++    let persisted_status = super::spawn::persisted_terminal_agent_status(&state, child_thread_id)
++        .await
++        .expect("persisted child lifecycle should be readable");
++    assert!(
++        matches!(
++            &persisted_status,
++            Some(AgentStatus::Completed(_)) | Some(AgentStatus::Shutdown)
++        ),
++        "persisted rollout should expose a terminal child status, got {persisted_status:?}"
++    );
 +
 +    // Simulate the historical defect after the old runtime is gone: completion is durable, but
 +    // the persisted spawn edge incorrectly remains open across the next application launch.
@@ -275,7 +289,11 @@ index 6f4cf55..e87d6a2 100644
 +        .await
 +        .expect("parent resume should succeed");
 +
-+    assert_thread_not_loaded(&harness.manager, child_thread_id).await;
++    assert_eq!(
++        harness.control.get_status(child_thread_id).await,
++        AgentStatus::NotFound,
++        "parent resume reconstructed a terminal child runtime"
++    );
 +    assert_eq!(
 +        graph
 +            .list_thread_spawn_children(parent_thread_id, Some(ThreadSpawnEdgeStatus::Open))
