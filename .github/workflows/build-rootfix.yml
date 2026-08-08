@@ -1,11 +1,11 @@
-name: Build Codex V2 runtime lifecycle root-fix
+name: Build consolidated Codex lifecycle root-fix
 
 on:
   workflow_dispatch:
   push:
     branches: [main]
     paths:
-      - patches/v2-runtime-lifecycle-rootfix.patch
+      - patches/consolidated-lifecycle-fix-2026-08-08.patch
       - .github/workflows/build-rootfix.yml
 
 permissions:
@@ -26,9 +26,11 @@ jobs:
           ref: 618b8e9111da9f57fe380b09d0f6516e3f343536
           path: upstream-codex
 
-      - name: Apply V2 runtime lifecycle patch
+      - name: Apply consolidated lifecycle patch
         shell: pwsh
-        run: git -C upstream-codex apply --check ../patches/v2-runtime-lifecycle-rootfix.patch; git -C upstream-codex apply ../patches/v2-runtime-lifecycle-rootfix.patch
+        run: |
+          git -C upstream-codex apply --check --whitespace=error-all ../patches/consolidated-lifecycle-fix-2026-08-08.patch
+          git -C upstream-codex apply ../patches/consolidated-lifecycle-fix-2026-08-08.patch
 
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -44,11 +46,15 @@ jobs:
         working-directory: upstream-codex/codex-rs
         run: cargo check -p codex-core --lib
 
-      - name: Test V2 runtime unload
+      - name: Test terminal lifecycle repair
         working-directory: upstream-codex/codex-rs
         env:
           RUST_MIN_STACK: "8388608"
-        run: cargo test -p codex-core completed_agent_runtime_unloads_but_terminal_status_remains_observable
+        run: |
+          cargo test -p codex-core completed_agent_runtime_unloads_but_terminal_status_remains_observable
+          cargo test -p codex-core residency_slot_reservation_unloads_oldest_idle_v2_agent
+          cargo test -p codex-core resume_agent_from_rollout_does_not_reopen_v2_descendants
+          cargo test -p codex-core completed_legacy_child_is_repaired_without_resuming_runtime
 
       - name: Test lazy history and first-turn MCP activation
         working-directory: upstream-codex/codex-rs

@@ -1,22 +1,41 @@
 # GPT_CODEX_subagentBUG_antipatch
 
-## Codex Desktop Subagent Lifecycle — Experimental Checkpoint
+## Codex Desktop subagent lifecycle — validated experimental checkpoint
 
-Public, sanitized checkpoint for investigation of a Codex Desktop lifecycle defect: completed subagents from an old task can appear as `Working` again and can trigger unnecessary local runtime processes when that task is reopened.
+This public, sanitized checkpoint records a temporary source-level repair for a
+Codex Desktop lifecycle defect: reopening a historical task with completed
+subagents must not recreate child runtimes, MCP transports, Node helpers, or
+model work.
 
-This repository is **not an official OpenAI fix** and is not a distributable Codex build. It records a small experimental anti-patch and the evidence-based next steps so the work can be reviewed and continued without sharing personal configuration, logs, binaries, or credentials.
+This is **not an official OpenAI fix**, a distributable Desktop build, or a
+permanent Codex fork.
 
 ## Current status
 
-- The affected local histories are predominantly `multi_agent_version: v2`, even when their storage mode is named `legacy`; the earlier V1-only diagnosis was insufficient.
-- The current patch defers MCP startup while an old task is merely displayed and restores it on the first real foreground action.
-- The current patch unloads a completed V2 child runtime through the normal shutdown path while retaining its logical identity and terminal status.
-- Stale `Working` rendering remains a separate UI/state-reconciliation defect; it must not force runtime startup.
-- The patch does **not** disable or remove MCP, plugins, browser control, computer use, or Node-based tools. They remain available and start on a real action that needs them.
-- Lightweight children are a routing/configuration concern: ordinary children receive a minimal profile, while specialist children receive only the tool family required by their assignment. The primary orchestrator can retain its full configured toolset.
+- Validated against upstream commit `618b8e9111da9f57fe380b09d0f6516e3f343536`
+  and Codex `0.147.0-alpha.6.5` on Windows.
+- Read-only history hydration defers MCP/tool startup until a real foreground
+  action.
+- Completed V2 child runtimes unload while terminal status and explicit resume
+  remain available.
+- Terminal rollout state repairs stale legacy V1 open edges without recreating
+  the child runtime.
+- Four controlled historical-task opens produced zero new Python, Node,
+  `node_repl`, MCP-start, child-spawn, or observed model-request events.
+- A stale `Working` badge can remain a separate UI projection issue; it must not
+  own or recreate runtime resources.
 
-See [the minimal root-fix](docs/ROOT-FIX.md), [the compact checkpoint](CHECKPOINT.md), and [patch notes](docs/PATCH-NOTES.md).
+The patch does not disable MCP, plugins, browser control, computer use, or Node
+tools. The primary orchestrator keeps its configured capabilities. Lightweight
+children use deny-by-default profiles, while specialist children receive only
+the tool family required by their assignment.
+
+See [the validation record](docs/VALIDATION-2026-08-08.md),
+[the compact checkpoint](CHECKPOINT.md), and
+[the patch notes](docs/PATCH-NOTES.md).
 
 ## Safety
 
-Do not copy local Codex state, session databases, logs, environment files, binaries, or user configuration into this repository. The patch is experimental and must be rebuilt and tested against the exact upstream source version before use.
+Do not commit local Codex state, task histories, databases, logs, screenshots,
+credentials, user configuration, or compiled binaries. Rebuild and revalidate
+after every upstream Codex update.

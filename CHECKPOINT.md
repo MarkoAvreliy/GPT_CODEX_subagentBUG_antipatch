@@ -1,35 +1,50 @@
-# Checkpoint — 2026-08-07
+# Checkpoint — 2026-08-08
 
-## Observed problem
+## Result
 
-On Codex Desktop, reopening an older task that previously used many subagents may show already-finished children as `Working`. Opening the parent task, or selecting individual stale child entries, can coincide with local process activity such as MCP-backed Python workers or Node-based helper processes. This is undesirable even if the model-side task had already produced a final response.
+The temporary lifecycle repair is operationally validated for one pinned
+Windows build. Opening the tested completed historical parent tasks no longer
+materialized child MCP/helper runtimes or caused observed model work.
 
-The behavior is reproducible enough to treat it as a lifecycle/state-restoration defect, not a workflow preference issue.
+Pinned inputs:
 
-## Evidence-backed hypothesis
+- upstream source: `618b8e9111da9f57fe380b09d0f6516e3f343536`;
+- Codex version: `0.147.0-alpha.6.5`;
+- patched executable SHA-256:
+  `06BDE4920EAF39EE5424DC6EEB0E54E347EAA5A877F60C8D92CBC04E2CFB2588`.
 
-Inspection of the affected rollouts corrected the earlier diagnosis: their storage mode is called `legacy`, but their actual agent lifecycle is V2. In V2, logical child identity remains resident after completion while heavy per-session runtime ownership is coupled to that identity. This creates two related but distinct failures:
+## Root failure and repair
 
-1. stale UI lifecycle state (`Working` instead of terminal state);
-2. unnecessary runtime/MCP rehydration when history is opened, plus completed V2 runtimes remaining resident.
+The investigation separated two defects:
 
-MCP process multiplication is a consequence of runtime rehydration when heavy local tools are available; it is not, by itself, the root cause.
+1. a completed child can be projected as `Working` from persisted/UI state;
+2. history restoration can incorrectly recreate or retain the runtime behind
+   that stale logical state.
 
-## Experimental anti-patch currently tested
+The patch prevents read-only history hydration from initializing MCP/tool
+runtime, hydrates durable terminal child state without loading the child,
+unloads completed V2 runtimes through the normal shutdown path, and repairs
+terminal legacy V1 edges without eager resume. Explicit future resume and the
+first real tool-requiring action remain supported.
 
-- **Lazy resume of MCP:** do not start MCP servers solely because a historical task is being restored; initialize them after a real new action needs them.
-- **V2 completed-child cleanup:** after a child reaches a terminal result, call the normal session shutdown path after a short grace period while keeping identity, history, and terminal status available.
+## Validation
 
-Focused source tests now pass for both behaviors. A real Desktop A/B against historical tasks is still required before calling the patch operationally verified.
+Four historical parent tasks were opened and allowed to hydrate. New Python,
+Node, and `node_repl` processes were all zero. Monitored MCP starts, child
+spawn/resume events, and model requests caused by navigation were also zero.
 
-## What remains
+The consolidated 14-file source patch applies cleanly to the pinned upstream
+commit. Its SHA-256 is
+`93813F18E93E26BBB291E563D891108B889089DFD05540BC28971FE5EA7C9BE8`.
 
-- Build the pinned Windows executable and run the real Desktop A/B.
-- Verify that UI `Working`/`Done` state does not reactivate runtime.
-- Measure process trees and model-request logs separately; a badge or local process alone is not proof of token use.
-- Verify deny-by-default child profiles and narrow document, memory, knowledge, browser, and computer-use specialist profiles without reducing the primary orchestrator's capabilities.
-- Rebuild and run UI end-to-end tests against historical task data.
+## Remaining boundary
 
-## Scope of this repository
+The packaged UI can still show a stale `Working` badge until the row is selected
+and reconciled. That presentation defect is not considered proof of active
+runtime or token use. Revalidate using process-tree and model-transport evidence.
 
-This is a public engineering checkpoint only. It intentionally excludes personal paths, Codex state databases, MCP configuration, credentials, logs, screenshots, compiled binaries, and user task history.
+Automatic self-restart from inside the Desktop process/job tree is not
+supported. Start the patched runtime from an independent shortcut or terminal.
+
+This checkpoint excludes personal paths, task history, state databases, logs,
+credentials, screenshots, and binaries.
