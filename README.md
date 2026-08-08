@@ -1,4 +1,6 @@
-# Codex Desktop Subagent Lifecycle — Experimental Checkpoint
+# GPT_CODEX_subagentBUG_antipatch
+
+## Codex Desktop Subagent Lifecycle — Experimental Checkpoint
 
 Public, sanitized checkpoint for investigation of a Codex Desktop lifecycle defect: completed subagents from an old task can appear as `Working` again and can trigger unnecessary local runtime processes when that task is reopened.
 
