@@ -26,7 +26,7 @@ index 76a7d19..b44d1c2 100644
                  let Some(child_agent_path) = child_agent_path.clone() else {
                      return;
 diff --git a/codex-rs/core/src/agent/control/spawn.rs b/codex-rs/core/src/agent/control/spawn.rs
-index 8645522..71922da 100644
+index 8645522..d7353c4 100644
 --- a/codex-rs/core/src/agent/control/spawn.rs
 +++ b/codex-rs/core/src/agent/control/spawn.rs
 @@ -1,6 +1,8 @@
@@ -38,7 +38,7 @@ index 8645522..71922da 100644
  use crate::config::PermissionProfileSnapshot;
  use codex_extension_api::ExtensionDataInit;
  
-@@ -123,6 +125,37 @@ async fn load_agent_model_context(
+@@ -123,6 +125,32 @@ async fn load_agent_model_context(
      }
  }
  
@@ -51,19 +51,14 @@ index 8645522..71922da 100644
 +    state: &ThreadManagerState,
 +    thread_id: ThreadId,
 +) -> CodexResult<Option<AgentStatus>> {
-+    let stored_thread = state
-+        .read_stored_thread(ReadThreadParams {
++    let history = state
++        .load_thread_history(LoadThreadHistoryParams {
 +            thread_id,
 +            include_archived: true,
-+            include_history: false,
 +        })
 +        .await?;
-+    let Some(history) =
-+        load_agent_model_context(state, thread_id, stored_thread.history_mode).await?
-+    else {
-+        return Ok(None);
-+    };
 +    Ok(history
++        .items
 +        .iter()
 +        .rev()
 +        .find_map(|item| match item {
@@ -76,7 +71,7 @@ index 8645522..71922da 100644
  impl AgentControl {
      /// Restore persisted V2 agent identities without reopening their runtimes.
      pub(crate) async fn restore_v2_agent_metadata(
-@@ -872,25 +905,58 @@ impl AgentControl {
+@@ -872,25 +900,58 @@ impl AgentControl {
                  let child_resumed = if state.get_thread(child_thread_id).await.is_ok() {
                      true
                  } else {
@@ -151,19 +146,18 @@ index 8645522..71922da 100644
                      }
                  };
 diff --git a/codex-rs/core/src/agent/control_tests.rs b/codex-rs/core/src/agent/control_tests.rs
-index 6f4cf55..eab725d 100644
+index 6f4cf55..9c322f0 100644
 --- a/codex-rs/core/src/agent/control_tests.rs
 +++ b/codex-rs/core/src/agent/control_tests.rs
-@@ -13,6 +13,8 @@ use crate::context::SubagentNotification;
+@@ -13,6 +13,7 @@ use crate::context::SubagentNotification;
  use crate::init_state_db;
  use crate::thread_manager::StartThreadOptions;
  use assert_matches::assert_matches;
-+use codex_agent_graph_store::AgentGraphStore;
 +use codex_agent_graph_store::ThreadSpawnEdgeStatus;
  use codex_extension_api::ExtensionDataInit;
  use codex_extension_api::empty_extension_registry;
  use codex_features::Feature;
-@@ -3819,6 +3821,125 @@ async fn resume_agent_from_rollout_does_not_reopen_closed_descendants() {
+@@ -3819,6 +3820,125 @@ async fn resume_agent_from_rollout_does_not_reopen_closed_descendants() {
          .expect("tree shutdown after resume should succeed");
  }
  
@@ -289,3 +283,40 @@ index 6f4cf55..eab725d 100644
  #[tokio::test]
  async fn resume_closed_child_reopens_open_descendants() {
      let harness = AgentControlHarness::new().await;
+diff --git a/codex-rs/core/src/thread_manager.rs b/codex-rs/core/src/thread_manager.rs
+index c636ace..af650bb 100644
+--- a/codex-rs/core/src/thread_manager.rs
++++ b/codex-rs/core/src/thread_manager.rs
+@@ -76,6 +76,7 @@ use codex_thread_store::ReadThreadByRolloutPathParams;
+ use codex_thread_store::ReadThreadParams;
+ use codex_thread_store::StoredModelContext;
+ use codex_thread_store::StoredThread;
++use codex_thread_store::StoredThreadHistory;
+ use codex_thread_store::ThreadMetadataPatch;
+ use codex_thread_store::ThreadStore;
+ use codex_thread_store::ThreadStoreError;
+@@ -1286,6 +1287,24 @@ impl ThreadManagerState {
+             })
+     }
+ 
++    pub(crate) async fn load_thread_history(
++        &self,
++        params: LoadThreadHistoryParams,
++    ) -> CodexResult<StoredThreadHistory> {
++        let thread_id = params.thread_id;
++        self.thread_store
++            .load_history(params)
++            .await
++            .map_err(|err| match err {
++                ThreadStoreError::ThreadNotFound { thread_id } => {
++                    CodexErr::ThreadNotFound(thread_id)
++                }
++                err => CodexErr::Fatal(format!(
++                    "failed to load persisted history for thread {thread_id}: {err}"
++                )),
++            })
++    }
++
+     /// Send an operation to a thread by ID.
+     pub(crate) async fn send_op(
+         &self,
