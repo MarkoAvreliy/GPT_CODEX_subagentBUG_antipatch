@@ -1,0 +1,21 @@
+# Keep this public checkpoint free of machine-local and sensitive artifacts.
+*.log
+*.sqlite
+*.sqlite3
+*.db
+*.jsonl
+*.exe
+*.dll
+*.pdb
+*.zip
+*.tar
+*.gz
+.env
+.env.*
+config.toml
+state/
+logs/
+evidence/
+screenshots/
+build/
+target/
