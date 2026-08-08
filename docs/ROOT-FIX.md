@@ -17,6 +17,20 @@ This patch does not remove, stub, or globally disable MCP, plugins, browser cont
 
 Future lightweight children should be implemented by deny-by-default child profiles plus narrow specialist profiles, not by amputating capabilities from Codex Desktop. A general worker can remain tool-light, while document, memory, knowledge, browser, and computer-use workers receive only their required integration. This routing policy is separate from the source patch.
 
+Codex does not discover an arbitrary `agents/<role>.toml` file solely because it exists. Each custom role, including a user override of a built-in role, must be declared in the parent configuration:
+
+```toml
+[agents.worker]
+description = "Lightweight execution child for coding, debugging, testing, and QA."
+config_file = "./agents/worker.toml"
+
+[agents.documents]
+description = "Document specialist with only the required document integration."
+config_file = "./agents/documents.toml"
+```
+
+The role file then carries the deny-by-default MCP/plugin layer and selectively enables its own integration. The primary configuration remains the full-capability orchestrator layer.
+
 This does not claim to repair every stale `Working` badge. UI reconciliation is separate from runtime ownership and is not allowed to materialize MCP or helper processes merely to display history.
 
 The GitHub Actions workflow builds only a testable `codex.exe` from pinned upstream source. It does not rebuild or redistribute the ChatGPT/Codex Desktop shell.
