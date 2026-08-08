@@ -42,6 +42,8 @@ jobs:
 
       - name: Run focused lifecycle regression test
         working-directory: upstream-codex/codex-rs
+        env:
+          RUST_MIN_STACK: "8388608"
         run: cargo test -p codex-core completed_legacy_child_is_repaired_without_resuming_runtime
 
       - name: Build patched Codex executable
