@@ -50,11 +50,14 @@ jobs:
           RUST_MIN_STACK: "8388608"
         run: cargo test -p codex-core completed_agent_runtime_unloads_but_terminal_status_remains_observable
 
-      - name: Test lazy historical resume
+      - name: Test lazy history and first-turn MCP activation
         working-directory: upstream-codex/codex-rs
         env:
           RUST_MIN_STACK: "8388608"
-        run: cargo test -p codex-app-server lazy_thread_resume_defers_required_mcp_initialization
+        run: |
+          cargo build -p codex-rmcp-client --bin test_stdio_server
+          $env:CARGO_BIN_EXE_test_stdio_server = (Resolve-Path '.\target\debug\test_stdio_server.exe').Path
+          cargo test -p codex-app-server lazy_thread_resume_ -- --nocapture
 
       - name: Build patched Codex executable
         working-directory: upstream-codex/codex-rs

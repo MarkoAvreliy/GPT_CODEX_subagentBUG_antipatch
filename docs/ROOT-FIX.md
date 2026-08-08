@@ -9,7 +9,7 @@ The patch targets the process-heavy V2 runtime lifecycle, which matches the affe
 3. A detached watcher observes a V2 child reaching a terminal status and invokes the existing `shutdown_and_wait` path after a five-second grace period.
 4. Only the heavy runtime is removed. Agent metadata, logical ID, terminal status, history, and explicit resume remain available.
 
-The focused tests prove that a completed child runtime disappears while `Completed` remains observable, and that historical resume succeeds even when a configured required MCP executable is deliberately invalid.
+The focused tests prove that a completed child runtime disappears while `Completed` remains observable, historical resume succeeds even when a configured required MCP executable is deliberately invalid, and the first real turn starts the deferred MCP server normally.
 
 This does not claim to repair every stale `Working` badge. UI reconciliation is separate from runtime ownership and is not allowed to materialize MCP or helper processes merely to display history.
 

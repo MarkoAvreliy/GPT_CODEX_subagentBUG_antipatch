@@ -1,8 +1,24 @@
 ﻿diff --git a/codex-rs/app-server/tests/suite/v2/thread_resume.rs b/codex-rs/app-server/tests/suite/v2/thread_resume.rs
-index a4410da23..fe816687e 100644
+index a4410da23..09a44fb7b 100644
 --- a/codex-rs/app-server/tests/suite/v2/thread_resume.rs
 +++ b/codex-rs/app-server/tests/suite/v2/thread_resume.rs
-@@ -4086,6 +4086,40 @@ required = true"#,
+@@ -105,6 +105,7 @@ use core_test_support::responses;
+ use core_test_support::skip_if_no_network;
+ use core_test_support::skip_if_remote;
+ use core_test_support::skip_if_wine_exec;
++use core_test_support::stdio_server_bin;
+ use pretty_assertions::assert_eq;
+ use serde_json::json;
+ use std::fs::FileTimes;
+@@ -115,6 +116,7 @@ use std::process::Command;
+ use std::time::Duration;
+ use tempfile::TempDir;
+ use tokio::time::timeout;
++use tokio::time::sleep;
+ use uuid::Uuid;
+ use wiremock::Mock;
+ use wiremock::MockServer;
+@@ -4086,6 +4088,111 @@ required = true"#,
      Ok(())
  }
  
@@ -36,6 +52,77 @@ index a4410da23..fe816687e 100644
 +
 +    assert_eq!(thread.id, rollout.conversation_id);
 +    assert_eq!(thread.status, ThreadStatus::Idle);
++
++    Ok(())
++}
++
++#[tokio::test]
++async fn lazy_thread_resume_starts_stdio_mcp_on_first_real_turn() -> Result<()> {
++    let server = create_mock_responses_server_repeating_assistant("Done").await;
++    let codex_home = TempDir::new()?;
++    let rollout = setup_rollout_fixture(codex_home.path(), &server.uri()).await?;
++    let pid_file = codex_home.path().join("lazy-resume-mcp.pid");
++    mock_responses_config(&server.uri())
++        .with_extra_config(&format!(
++            r#"[mcp_servers.lazy_probe]
++command = {}
++
++[mcp_servers.lazy_probe.env]
++MCP_TEST_PID_FILE = {}
++"#,
++            toml::Value::String(stdio_server_bin()?),
++            toml::Value::String(pid_file.to_string_lossy().into_owned()),
++        ))
++        .write(codex_home.path())?;
++
++    let mut mcp = TestAppServer::builder()
++        .with_codex_home(codex_home.path())
++        .with_env_overrides(&[("CODEX_EXPERIMENTAL_LAZY_RESUME_MCP", Some("1"))])
++        .build_initialized()
++        .await?;
++
++    let resume_id = mcp
++        .send_thread_resume_request(ThreadResumeParams {
++            thread_id: rollout.conversation_id.clone(),
++            ..Default::default()
++        })
++        .await?;
++    let ThreadResumeResponse { thread, .. } =
++        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
++
++    sleep(Duration::from_millis(500)).await;
++    assert!(
++        !pid_file.exists(),
++        "read-only resume unexpectedly started the stdio MCP server"
++    );
++
++    let turn_id = mcp
++        .send_turn_start_request(TurnStartParams {
++            thread_id: thread.id,
++            client_user_message_id: None,
++            input: vec![UserInput::Text {
++                text: "Continue without calling a tool".to_string(),
++                text_elements: Vec::new(),
++            }],
++            ..Default::default()
++        })
++        .await?;
++    timeout(
++        DEFAULT_READ_TIMEOUT,
++        mcp.read_stream_until_response_message(RequestId::Integer(turn_id)),
++    )
++    .await??;
++    timeout(
++        DEFAULT_READ_TIMEOUT,
++        mcp.read_stream_until_notification_message("turn/completed"),
++    )
++    .await??;
++    timeout(DEFAULT_READ_TIMEOUT, async {
++        while !pid_file.exists() {
++            sleep(Duration::from_millis(10)).await;
++        }
++    })
++    .await?;
 +
 +    Ok(())
 +}
