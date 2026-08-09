@@ -32,7 +32,8 @@ the tool family required by their assignment.
 
 See [the validation record](docs/VALIDATION-2026-08-08.md),
 [the compact checkpoint](CHECKPOINT.md), and
-[the patch notes](docs/PATCH-NOTES.md).
+[the patch notes](docs/PATCH-NOTES.md). See also the
+[related startup-host hypothesis](docs/RELATED-STARTUP-HOST-HYPOTHESIS.md).
 
 ## Safety
 
